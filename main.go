@@ -14,14 +14,14 @@ const (
 	chunkSize = 512
 )
 const (
-	undefinedErr        = iota
-	fileNotFoundErr     = iota
-	accessViolationErr  = iota
-	diskFullErr         = iota
-	illegalOperationErr = iota
-	unknownTIDErr       = iota
-	fileExistsErr       = iota
-	noSuchUserErr       = iota
+	undefinedErr = iota
+	fileNotFoundErr
+	accessViolationErr
+	diskFullErr
+	illegalOperationErr
+	unknownTIDErr
+	fileExistsErr
+	noSuchUserErr
 )
 
 var (
@@ -34,17 +34,19 @@ var (
 func main() {
 	ackChans = make(map[string]chan int)
 	dataChans = make(map[string]chan []byte)
-	pc, err := net.ListenPacket("udp", "0.0.0.0:8069")
-
+	port := os.Getenv("PORT")
+	pc, err := net.ListenPacket("udp", "0.0.0.0:"+port)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("err:", err)
 	}
 	defer pc.Close()
+	log.Println("Listening on:", pc.LocalAddr().String())
+
 	for {
 		buf := make([]byte, 516)
 		rn, addr, err := pc.ReadFrom(buf)
 		if err != nil {
-			log.Fatal(err)
+			log.Println("err:", err)
 		}
 		//log.Println("from:", addr.String(), "network", addr.Network(), "read:", rn, "data:", string(buf))
 
@@ -53,8 +55,7 @@ func main() {
 			ack(pc, addr, 0, buf[1]%2)
 
 			endFileName := bytes.IndexByte(buf[2:], 0) + 2
-			endMode := bytes.IndexByte(buf[endFileName+1:], 0) + endFileName
-			if mode := string(buf[endFileName+1 : endMode+1]); mode != string([]byte("octet")) {
+			if mode := string(buf[endFileName+1 : rn-1]); mode != string([]byte("octet")) {
 				error(pc, addr, undefinedErr, "only octet mode supported")
 				continue
 			}
@@ -95,8 +96,7 @@ func main() {
 					close(c)
 				}()
 			}
-		case 3:
-			// TODO: use TID here?
+		case 3: // received data
 			dataLock.RLock()
 			if c, ok := dataChans[addr.String()]; ok {
 				c <- buf[2:rn]
@@ -105,12 +105,11 @@ func main() {
 		case 4: // received ack
 			ackLock.RLock()
 			if c, ok := ackChans[addr.String()]; ok {
-				c <- int(buf[2])*256 + int(buf[3])
+				c <- convertBlockBytes(buf[2], buf[3])
 			}
 			ackLock.RUnlock()
 		case 5: // errors
-			endError := bytes.IndexByte(buf[4:], 0) + 4
-			log.Println("err_code:", buf[3], "err:", string(buf[4:endError]))
+			log.Println("err_code:", buf[3], "err:", string(buf[4:rn-1]))
 		default:
 			error(pc, addr, illegalOperationErr, "illegal operation")
 		}
@@ -119,9 +118,8 @@ func main() {
 
 func ack(pc net.PacketConn, addr net.Addr, bh, bl byte) {
 	_, err := pc.WriteTo([]byte{0, 4, bh, bl, 0}, addr)
-	// TODO: try again instead?
 	if err != nil {
-		log.Fatal(err)
+		log.Println("err:", err)
 	}
 }
 
@@ -131,20 +129,49 @@ func error(pc net.PacketConn, addr net.Addr, code byte, msg string) {
 	pc.WriteTo(errPacket, addr)
 }
 
+func convertBlockBytes(b0, b1 byte) int {
+	return int(b0)*256 + int(b1)
+}
+
 func writeFile(pc net.PacketConn, addr net.Addr, filename string, data <-chan []byte) {
-	if _, err := os.Stat("files/" + filename); !os.IsNotExist(err) {
+	if _, err := os.Stat(filename); !os.IsNotExist(err) {
 		error(pc, addr, fileExistsErr, "file exists")
 		return
 	}
-	file, err := os.Create("files/" + filename)
+	file, err := os.Create(filename)
 	if err != nil {
 		error(pc, addr, 0, err.Error())
 		return
 	}
 	defer file.Close()
 
+	var buf []byte
 	for {
-		buf := <-data
+		for i := 0; i < 4; i++ {
+			select {
+			case b := <-data:
+				if len(buf) > 2 {
+					prevBlock := convertBlockBytes(buf[0], buf[1])
+					curBlock := convertBlockBytes(b[0], b[1])
+					// large file rollover
+					if prevBlock == 65535 && curBlock <= 1 {
+						buf = b
+						break
+					}
+					if prevBlock >= curBlock {
+						log.Printf("dup data packet bn: %v%v", b[0], b[1])
+						continue
+					}
+				}
+				buf = b
+			case <-time.After(time.Second * 5):
+				// resend last ack
+				ack(pc, addr, buf[0], buf[1])
+				continue
+			}
+			break
+		}
+		// slice off block number
 		wn, err := file.Write(buf[2:])
 		if err != nil {
 			error(pc, addr, 0, err.Error())
@@ -164,13 +191,13 @@ func writeFile(pc net.PacketConn, addr net.Addr, filename string, data <-chan []
 }
 
 func sendFile(pc net.PacketConn, addr net.Addr, filename string, ack <-chan int) {
-	if _, err := os.Stat("files/" + filename); os.IsNotExist(err) {
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
 		error(pc, addr, fileNotFoundErr, "file not found")
 		return
 	}
-	file, err := os.Open("files/" + filename)
+	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatal(err)
+		error(pc, addr, undefinedErr, err.Error())
 	}
 
 	chunk := make([]byte, 0, 516)
@@ -189,7 +216,7 @@ func sendFile(pc net.PacketConn, addr net.Addr, filename string, ack <-chan int)
 		sendBlock := func() {
 			_, err := pc.WriteTo(buf.Bytes(), addr)
 			if err != nil {
-				log.Fatal(err)
+				log.Println("err:", err)
 			}
 		}
 		sendBlock()
@@ -199,10 +226,11 @@ func sendFile(pc net.PacketConn, addr net.Addr, filename string, ack <-chan int)
 				// discard dup ack
 				// TODO: test
 				if ackBlock < b {
+					log.Println("dup ack packet")
 					continue
 				}
 				if ackBlock != b {
-					log.Println("Ack Block MisMatch got:", ackBlock, "expected:", b)
+					log.Println("ack block number mismatch got:", ackBlock, "expected:", b)
 				}
 			case <-time.After(time.Second * 5):
 				// no ack received
